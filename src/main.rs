@@ -1,6 +1,12 @@
 use std::env;
 use std::process::{Command, Stdio};
 use std::io::{self, Write};
+use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::FromRawHandle;
+
+extern crate regex;
+use regex::bytes::Regex;
+use regex::bytes::Captures;
 
 fn translate_path_to_unix(arg: String) -> String {
     if let Some(index) = arg.find(":\\") {
@@ -118,29 +124,44 @@ fn main() {
         .wait_with_output()
         .expect(&format!("Failed to wait for git call '{}'", &git_cmd));
 
-    // add git commands that must skip translate_path_to_win
+    // add git commands that must skip translate_path_to_win and
+    // transparently pass-through bytes of data with no charset
+    // validation or conversion
     // e.g. = &["show", "status, "rev-parse", "for-each-ref"];
     const NO_TRANSLATE: &'static [&'static str] = &["show"];
-    if NO_TRANSLATE.iter().position(|&r| r == git_args[1]).is_none() {
-        // force with no checking or conversion returned data
-        // into a Rust UTF-8 String
-        let output_str = unsafe {
-            String::from_utf8_unchecked(output.stdout)
-        };
-        // iterate through lines (LR or CRLF endings) and output
-        // each line with paths translated and ending with the
-        // native line ending (CRLF)
-        for line in output_str.lines().map(translate_path_to_win) {
-            println!("{}", line);
-        }
+
+    // write any stdout
+    if (git_args.len() == 1) || (NO_TRANSLATE.iter().position(|&r| r == git_args[1]).is_none()) {
+        // search for all occurrances of *nix paths at the start of any line
+        let re_lines = Regex::new(r"(?m-u)^/mnt/([A-Za-z])(/.*)$").unwrap(); // for backslash use: = Regex::new(r"(?m-u)^/mnt/([a-z])/(.*)$").unwrap();
+        let result = re_lines.replace_all(&output.stdout, |caps: &Captures| {
+            // preallocate a vector with the known size
+            let mut new_path: Vec<u8> = Vec::with_capacity(caps[2].len() + 2); // for backslash use: = Vec::with_capacity(caps[2].len() + 3);  
+            // construct the DOS path
+            new_path.push(caps[1][0].to_ascii_uppercase());
+            new_path.push(b':');
+            new_path.extend_from_slice(&caps[2]);
+            // separate folders with a DOS backslash
+            //for folder in caps[2].split(|old_char| *old_char == b'/') {
+            //    new_path.push(b'\\');
+            //    new_path.extend(folder);
+            //}
+            return new_path;
+        });
+        io::stdout().write_all(&result).unwrap();
+        // std::process::exit does not call destructors; must manually flush
+        io::stdout().flush().unwrap();
     }
     else {
         // output all data unaltered so to not corrupt data output
-        io::stdout().write_all(&output.stdout).unwrap();
+        let raw_stdout = io::stdout().as_raw_handle();
+        unsafe {
+            let mut doit = std::fs::File::from_raw_handle(raw_stdout);
+            doit.write_all(&output.stdout).unwrap();
+            // std::process::exit does not call destructors; must manually flush
+            doit.flush().unwrap();
+        }
     }
-
-    // std::process::exit does not call destructors; must manually flush stdout
-    io::stdout().flush().unwrap();
 
     // forward any exit code
     if let Some(exit_code) = output.status.code() {

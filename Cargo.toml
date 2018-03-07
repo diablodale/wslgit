@@ -5,3 +5,4 @@ authors = ["Andreas Riffnaller-Schiefer <andreas.schiefer@gmail.com>"]
 license = "MIT"
 
 [dependencies]
+regex = "0.2"
