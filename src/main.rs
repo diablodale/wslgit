@@ -4,31 +4,30 @@ use std::io::{self, Write};
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::io::FromRawHandle;
 
+#[macro_use] extern crate lazy_static;
 extern crate regex;
-use regex::bytes::Regex;
-use regex::bytes::Captures;
+use regex::bytes;
 
+// search for all occurrances of absolute DOS paths at the start of string
+// this will     match on absolute DOS paths using backslashes, e.g. c:\myfile.txt
+// this will     match on absolute DOS paths using foward slashes, e.g. c:/myfile.txt
+// this will not match on relative paths, e.g. mydir\myfile.txt
+// this will not change backslashes -> slash for relative paths, e.g. mydir/myfile.txt
+// this will not work with UNC, e.g. \\server\share\path\file.txt
 fn translate_path_to_unix(arg: String) -> String {
-    if let Some(index) = arg.find(":\\") {
-        if index != 1 {
-            // Not a path
-            return arg;
-        }
-        let mut path_chars = arg.chars();
-        if let Some(drive) = path_chars.next() {
-            let mut wsl_path = String::from("/mnt/");
-            wsl_path.push_str(&drive.to_lowercase().collect::<String>());
-            path_chars.next();
-            wsl_path.push_str(&path_chars.map(|c|
-                    match c {
-                        '\\' => '/',
-                        _ => c,
-                    }
-                ).collect::<String>());
-            return wsl_path;
-        }
+    lazy_static! {
+        static ref RE_DOSPATH: regex::Regex = regex::Regex::new(r"^([A-Za-z]):((?:\\|/).*)$").unwrap();
     }
-    arg
+    let result = RE_DOSPATH.replace(&arg, |caps: &regex::Captures| {
+        // preallocate a String with the known size
+        let mut new_path: String = String::with_capacity(caps[2].len() + 6);
+        // construct the WSL path
+        new_path.push_str("/mnt/");
+        new_path.push_str(&caps[1].to_ascii_lowercase());
+        new_path.push_str(&caps[2].replace("\\", "/"));
+        return new_path;
+    });
+    return result.into_owned();
 }
 
 fn translate_path_to_win(line: &str) -> String {
@@ -132,9 +131,11 @@ fn main() {
 
     // write any stdout
     if (git_args.len() == 1) || (NO_TRANSLATE.iter().position(|&r| r == git_args[1]).is_none()) {
-        // search for all occurrances of *nix paths at the start of any line
-        let re_lines = Regex::new(r"(?m-u)^/mnt/([A-Za-z])(/.*)$").unwrap(); // for backslash use: = Regex::new(r"(?m-u)^/mnt/([a-z])/(.*)$").unwrap();
-        let result = re_lines.replace_all(&output.stdout, |caps: &Captures| {
+        lazy_static! {
+            // search for all occurrances of *nix paths at the start of any line
+            static ref RE_WSLPATH: bytes::Regex = bytes::Regex::new(r"(?m-u)^/mnt/([A-Za-z])(/.*)$").unwrap(); // for backslash use: = bytes::Regex::new(r"(?m-u)^/mnt/([a-z])/(.*)$").unwrap();
+        }
+        let result = RE_WSLPATH.replace_all(&output.stdout, |caps: &bytes::Captures| {
             // preallocate a vector with the known size
             let mut new_path: Vec<u8> = Vec::with_capacity(caps[2].len() + 2); // for backslash use: = Vec::with_capacity(caps[2].len() + 3);  
             // construct the DOS path
