@@ -1,8 +1,6 @@
 use std::env;
 use std::process::{Command, Stdio};
 use std::io::{self, Write};
-use std::os::windows::io::AsRawHandle;
-use std::os::windows::io::FromRawHandle;
 
 #[macro_use] extern crate lazy_static;
 extern crate regex;
@@ -16,6 +14,7 @@ use regex::bytes;
 // this will not work with UNC, e.g. \\server\share\path\file.txt
 fn translate_path_to_unix(arg: String) -> String {
     lazy_static! {
+        // can't yet force non-UTF8 with (?-u)
         static ref RE_DOSPATH: regex::Regex = regex::Regex::new(r"^([A-Za-z]):((?:\\|/).*)$").unwrap();
     }
     let result = RE_DOSPATH.replace(&arg, |caps: &regex::Captures| {
@@ -28,30 +27,6 @@ fn translate_path_to_unix(arg: String) -> String {
         return new_path;
     });
     return result.into_owned();
-}
-
-fn translate_path_to_win(line: &str) -> String {
-    if let Some(index) = line.find("/mnt/") {
-        if index != 0 {
-            // Path somewhere in the middle, don't change
-            return String::from(line);
-        }
-        let mut path_chars = line.chars();
-        if let Some(drive) = path_chars.nth(5) {
-            if let Some(slash) = path_chars.next() {
-                if slash != '/' {
-                    // not a windows mount
-                    return String::from(line);
-                }
-                let mut win_path = String::from(
-                    drive.to_lowercase().collect::<String>());
-                win_path.push_str(":\\");
-                win_path.push_str(&path_chars.collect::<String>());
-                return win_path.replace("/", "\\");
-            }
-        }
-    }
-    String::from(line)
 }
 
 fn shell_escape(arg: String) -> String {
@@ -112,17 +87,11 @@ fn main() {
         Stdio::inherit()
     };
 
-    // launch git inside WSL
-    let git_proc = Command::new("wsl")
-        .args(&cmd_args)
-        .stdin(stdin_mode)
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect(&format!("Failed to execute command '{}'", &git_cmd));
-    let output = git_proc
-        .wait_with_output()
-        .expect(&format!("Failed to wait for git call '{}'", &git_cmd));
-
+    // setup the git subprocess launched inside WSL
+    let mut git_proc_setup = Command::new("wsl");
+    git_proc_setup.args(&cmd_args)
+        .stdin(stdin_mode);
+    
     // add git commands that must skip translate_path_to_win and
     // transparently pass-through bytes of data with no charset
     // validation or conversion
@@ -130,42 +99,48 @@ fn main() {
     const NO_TRANSLATE: &'static [&'static str] = &["show"];
 
     // write any stdout
-    if (git_args.len() == 1) || (NO_TRANSLATE.iter().position(|&r| r == git_args[1]).is_none()) {
+    let status = if (git_args.len() > 1) && (NO_TRANSLATE.iter().position(|&r| r == git_args[1]).is_none()) {
+        // run the subprocess and capture its output
+        let git_proc = git_proc_setup
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect(&format!("Failed to execute command '{}'", &git_cmd));
+        let output = git_proc
+            .wait_with_output()
+            .expect(&format!("Failed to wait for git call '{}'", &git_cmd));
+
+        // search for all occurrances of *nix paths at the start of any line
         lazy_static! {
-            // search for all occurrances of *nix paths at the start of any line
-            static ref RE_WSLPATH: bytes::Regex = bytes::Regex::new(r"(?m-u)^/mnt/([A-Za-z])(/.*)$").unwrap(); // for backslash use: = bytes::Regex::new(r"(?m-u)^/mnt/([a-z])/(.*)$").unwrap();
+            // Rust stdio demands utf-8 via vec<u8>, don't need to parse so can use faster non utf-8 regex engine
+            static ref RE_WSLPATH: bytes::Regex = bytes::Regex::new(r"(?m-u)^/mnt/([A-Za-z])(/.*)$").unwrap();
         }
         let result = RE_WSLPATH.replace_all(&output.stdout, |caps: &bytes::Captures| {
             // preallocate a vector with the known size
-            let mut new_path: Vec<u8> = Vec::with_capacity(caps[2].len() + 2); // for backslash use: = Vec::with_capacity(caps[2].len() + 3);  
+            let mut new_path: Vec<u8> = Vec::with_capacity(caps[2].len() + 2);
             // construct the DOS path
             new_path.push(caps[1][0].to_ascii_uppercase());
             new_path.push(b':');
             new_path.extend_from_slice(&caps[2]);
-            // separate folders with a DOS backslash
-            //for folder in caps[2].split(|old_char| *old_char == b'/') {
-            //    new_path.push(b'\\');
-            //    new_path.extend(folder);
-            //}
             return new_path;
         });
         io::stdout().write_all(&result).unwrap();
+
         // std::process::exit does not call destructors; must manually flush
         io::stdout().flush().unwrap();
+
+        // return status of child process
+        output.status
     }
     else {
-        // output all data unaltered so to not corrupt data output
-        let raw_stdout = io::stdout().as_raw_handle();
-        unsafe {
-            let mut doit = std::fs::File::from_raw_handle(raw_stdout);
-            doit.write_all(&output.stdout).unwrap();
-            // std::process::exit does not call destructors; must manually flush
-            doit.flush().unwrap();
-        }
-    }
+        // run the subprocess without capturing its output
+        // the output of the subprocess is passed through unchanged
+        git_proc_setup
+            .status()
+            .expect(&format!("Failed to execute command '{}'", &git_cmd))
+    };
 
     // forward any exit code
-    if let Some(exit_code) = output.status.code() {
+    if let Some(exit_code) = status.code() {
         std::process::exit(exit_code);
     }
 }
